@@ -199,6 +199,140 @@ function Restore-Util {
     }
     Import-Module -Assembly $asm -ErrorAction Stop
 }
+#region DEBUG helpers (test build only): explain why LoadLibrary failed
+function Get-PeImports {
+    # Lists the DLL names a PE file imports (static + delay-load), read straight from the file bytes.
+    param([byte[]]$b)
+    $pe     = [BitConverter]::ToInt32($b, 0x3C)
+    $magic  = [BitConverter]::ToUInt16($b, $pe + 24)
+    $ddOff  = if ($magic -eq 0x20B) { $pe + 24 + 112 } else { $pe + 24 + 96 }
+    $nSec   = [BitConverter]::ToUInt16($b, $pe + 6)
+    $secTbl = $pe + 24 + [BitConverter]::ToUInt16($b, $pe + 20)
+    $toOff = {
+        param([uint32]$rva)
+        for ($s = 0; $s -lt $nSec; $s++) {
+            $p  = $secTbl + ($s * 40)
+            $vs = [BitConverter]::ToUInt32($b, $p + 8);  $va = [BitConverter]::ToUInt32($b, $p + 12)
+            $rs = [BitConverter]::ToUInt32($b, $p + 16); $rp = [BitConverter]::ToUInt32($b, $p + 20)
+            if ($rva -ge $va -and $rva -lt ([uint64]$va + [Math]::Max($vs, $rs))) { return [int]($rva - $va + $rp) }
+        }
+        return -1
+    }
+    $readStr = {
+        param([int]$off)
+        $end = [Array]::IndexOf($b, [byte]0, $off)
+        [Text.Encoding]::ASCII.GetString($b, $off, $end - $off)
+    }
+    $out = New-Object System.Collections.ArrayList
+    # (data directory index, descriptor size, offset of the name RVA, label)
+    foreach ($d in @(@(1, 20, 12, 'static'), @(13, 32, 4, 'delay'))) {
+        $rva = [BitConverter]::ToUInt32($b, $ddOff + 8 * $d[0])
+        if ($rva -eq 0) { continue }
+        $o = & $toOff $rva
+        while ($o -ge 0 -and ($o + $d[1]) -le $b.Length) {
+            $nameRva = [BitConverter]::ToUInt32($b, $o + $d[2])
+            if ($nameRva -eq 0) { break }
+            $no = & $toOff $nameRva
+            if ($no -ge 0) { [void]$out.Add([pscustomobject]@{ Name = (& $readStr $no); Kind = $d[3] }) }
+            $o += $d[1]
+        }
+    }
+    return $out
+}
+function Test-DllImports {
+    # Tries to load every DLL that $Path imports. For one that fails and exists on disk, checks its own imports too.
+    param([string]$Path, [hashtable]$Seen, [System.Collections.ArrayList]$Failed, [int]$Depth = 0)
+    $pad    = '    ' * $Depth
+    $sysDir = [Environment]::SystemDirectory
+    $ok     = New-Object System.Collections.ArrayList
+    $failsHere = 0
+    foreach ($imp in @(Get-PeImports ([IO.File]::ReadAllBytes($Path)))) {
+        if ($Depth -gt 0 -and $imp.Kind -ne 'static') { continue }
+        $key = $imp.Name.ToLowerInvariant()
+        if ($Seen.ContainsKey($key)) { continue }
+        $err = [HwidDbg]::TryLoad($imp.Name, 0, $false)
+        $Seen[$key] = $err
+        if ($err -eq 0) { [void]$ok.Add($imp.Name); continue }
+        $msg = ([ComponentModel.Win32Exception]$err).Message
+        $failsHere++
+        $note = if ($imp.Kind -eq 'delay') { ' [delay-load: not needed just to load the DLL]' } else { '' }
+        Write-Host "[DEBUG] $pad  FAIL $($imp.Kind.PadRight(6)) $($imp.Name) -> error $err ($msg)$note"
+        if ($imp.Kind -eq 'static') { [void]$Failed.Add($imp.Name) }
+        if ($imp.Name -match '^(api|ext)-ms-') {
+            Write-Host "[DEBUG] $pad       this is an API set name with no implementation in this process"
+            continue
+        }
+        $file = Join-Path $sysDir $imp.Name
+        if (-not (Test-Path -LiteralPath $file)) {
+            Write-Host "[DEBUG] $pad       file is not present in the system folder this process sees"
+            continue
+        }
+        if ($Depth -lt 4) {
+            Write-Host "[DEBUG] $pad       file exists, checking what it needs:"
+            Test-DllImports -Path $file -Seen $Seen -Failed $Failed -Depth ($Depth + 1)
+        }
+    }
+    if ($Depth -gt 0 -and $failsHere -eq 0) { Write-Host "[DEBUG] $pad  none of its own imports fail, so this DLL fails while starting up (or was already reported above)" }
+    if ($Depth -eq 0) { Write-Host "[DEBUG]   loaded OK ($($ok.Count)): $($ok -join ', ')" }
+}
+function Write-LoadDebug {
+    param([string]$Path)
+    if (!([PSTypeName]'HwidDbg').Type) {
+        Add-Type -TypeDefinition @"
+using System;
+using System.Runtime.InteropServices;
+
+public static class HwidDbg {
+    [DllImport("kernel32", SetLastError = true, CharSet = CharSet.Unicode)]
+    private static extern IntPtr LoadLibraryExW(string lpFileName, IntPtr hFile, uint dwFlags);
+    [DllImport("kernel32", SetLastError = true)]
+    private static extern bool FreeLibrary(IntPtr hModule);
+
+    // 0 = loaded; otherwise the Win32 error code, read immediately after the call so nothing can overwrite it
+    public static int TryLoad(string name, uint flags, bool free) {
+        IntPtr h = LoadLibraryExW(name, IntPtr.Zero, flags);
+        int err = Marshal.GetLastWin32Error();
+        if (h == IntPtr.Zero) return err == 0 ? -1 : err;
+        if (free) FreeLibrary(h);
+        return 0;
+    }
+}
+"@
+    }
+    $fmt = { param([int]$e) if ($e -eq 0) { 'OK' } else { "FAILED, error $e ($(([ComponentModel.Win32Exception]$e).Message))" } }
+    $leaf = Split-Path $Path -Leaf
+    $cv = Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion' -ErrorAction SilentlyContinue
+
+    Write-Host "[DEBUG] ================ LoadLibrary failure diagnostics ================"
+    Write-Host "[DEBUG] Windows    : $($cv.ProductName) | edition $($cv.EditionID) | $($cv.InstallationType) | build $($cv.CurrentBuild).$($cv.UBR)"
+    Write-Host "[DEBUG] Process    : $([IntPtr]::Size * 8)-bit | PROCESSOR_ARCHITECTURE=$env:PROCESSOR_ARCHITECTURE | PROCESSOR_ARCHITEW6432=$env:PROCESSOR_ARCHITEW6432"
+    Write-Host "[DEBUG] PowerShell : $($PSVersionTable.PSVersion) | system folder: $([Environment]::SystemDirectory)"
+
+    $b       = [IO.File]::ReadAllBytes($Path)
+    $pe      = [BitConverter]::ToInt32($b, 0x3C)
+    $machine = [BitConverter]::ToUInt16($b, $pe + 4)
+    $ver     = [Diagnostics.FileVersionInfo]::GetVersionInfo($Path).FileVersion
+    Write-Host ("[DEBUG] File       : {0} | {1} bytes | version {2} | machine 0x{3:X4} (0x014C=x86, 0x8664=x64, 0xAA64=ARM64)" -f $Path, $b.Length, $ver, $machine)
+    foreach ($dir in 'System32', 'SysWOW64', 'Sysnative') {
+        $p = Join-Path $env:windir "$dir\$leaf"
+        $state = if (Test-Path -LiteralPath $p) { "present, $((Get-Item -LiteralPath $p).Length) bytes" } else { 'not present' }
+        Write-Host "[DEBUG]   as seen by this process, $dir\$leaf : $state"
+    }
+
+    Write-Host "[DEBUG] Normal load                      : $(& $fmt ([HwidDbg]::TryLoad($Path, 0, $false)))"
+    Write-Host "[DEBUG] Load as data file only           : $(& $fmt ([HwidDbg]::TryLoad($Path, 2, $true)))"
+    Write-Host "[DEBUG] Load without resolving imports   : $(& $fmt ([HwidDbg]::TryLoad($Path, 1, $true)))"
+
+    Write-Host "[DEBUG] Trying each DLL that $leaf imports:"
+    $failed = New-Object System.Collections.ArrayList
+    Test-DllImports -Path $Path -Seen @{} -Failed $failed
+    if ($failed.Count) { Write-Host "[DEBUG] VERDICT: $($failed.Count) required import(s) cannot be loaded: $($failed -join ', ')" }
+    else               { Write-Host "[DEBUG] VERDICT: every required import loads on its own, so the failure is not a missing DLL (see the error codes above)" }
+    Write-Host "[DEBUG] ================================================================="
+    [Console]::Out.Flush()
+}
+#endregion
+
 function Get-WinRTHwid {
     [CmdletBinding()]
     param(
@@ -309,7 +443,12 @@ public static class Native {
 
     # ---- LoadLibrary + delegate call ----
     $h = [Native]::LoadLibraryW($WinrtDll)
-    if ($h -eq [IntPtr]::Zero) { throw "LoadLibrary failed (err $([Marshal]::GetLastWin32Error()))" }
+    if ($h -eq [IntPtr]::Zero) {
+        $loadErr = [Marshal]::GetLastWin32Error()
+        try   { Write-LoadDebug -Path $WinrtDll }
+        catch { Write-Host "[DEBUG] the debug helper itself failed: $($_.Exception.Message)" }
+        throw "LoadLibrary failed (err $loadErr)"
+    }
     $call = [Marshal]::GetDelegateForFunctionPointer([IntPtr]([int64]$h + $Rva), [HwidGetCurrentExDelegate])
 
     $buf=[IntPtr]::Zero; $o1=[IntPtr]::Zero; $o2=[IntPtr]::Zero; $o3=[IntPtr]::Zero

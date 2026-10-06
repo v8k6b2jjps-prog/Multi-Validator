@@ -236,12 +236,18 @@ public static class Native {
     if ($Rva -le 0) {
       try {
         $Rva = Resolve-SymbolFromPdb -BinaryPath C:\Windows\System32\LicensingWinRT.dll -FunctionName HwidGetCurrentEx
+        Write-Host ("[TEST] RVA from PDB symbol   : 0x{0:X}" -f $Rva)
       } 
       catch {
+        Write-Host "[TEST] RVA from PDB symbol   : FAILED - $($_.Exception.Message)"
         $Rva = 0
       }
     }
-    if ($Rva -le 0 -and !$IsArm64 -and !$Is32Bit) {
+    # TEST BUILD: on x64 the pattern scan always runs as well, so it can be compared with the PDB result
+    $pdbRva = $Rva
+    if (!$IsArm64 -and !$Is32Bit) {
+      try {
+        $Rva = 0
         # Stage 1: CMP r32, 0x118
         $cmp = -1
         for ($i = 3; $i -lt $b.Length - 4; $i++) {
@@ -288,7 +294,18 @@ public static class Native {
             if ($off -ge $rawP -and $off -lt ($rawP + $rawS)) { $Rva = [int64](($off - $rawP) + $va); break }
         }
         if ($Rva -le 0) { throw ("Could not map offset 0x{0:X} to an RVA" -f $off) }
+        Write-Host ("[TEST] RVA from pattern scan : 0x{0:X}" -f $Rva)
+      }
+      catch {
+        Write-Host "[TEST] RVA from pattern scan : FAILED - $($_.Exception.Message)"
+        $Rva = 0
+      }
+      if ($pdbRva -gt 0) {
+        if ($Rva -gt 0) { Write-Host "[TEST] PDB and scan agree    : $($Rva -eq $pdbRva)" }
+        $Rva = $pdbRva      # PDB result is preferred, as in the original
+      }
     }
+    if ($Rva -le 0) { throw "No RVA for HwidGetCurrentEx (PDB lookup failed, pattern scan failed or not available on this architecture)" }
 
     # ---- LoadLibrary + delegate call ----
     $h = [Native]::LoadLibraryW($WinrtDll)
@@ -296,7 +313,9 @@ public static class Native {
     $call = [Marshal]::GetDelegateForFunctionPointer([IntPtr]([int64]$h + $Rva), [HwidGetCurrentExDelegate])
 
     $buf=[IntPtr]::Zero; $o1=[IntPtr]::Zero; $o2=[IntPtr]::Zero; $o3=[IntPtr]::Zero
+    Write-Host ("[TEST] Calling HwidGetCurrentEx at RVA 0x{0:X} ..." -f $Rva); [Console]::Out.Flush()
     $hr = $call.Invoke([IntPtr]::Zero, 0, [ref]$buf, [ref]$o1, [ref]$o2, [ref]$o3)
+    Write-Host ("[TEST] HwidGetCurrentEx returned : hr=0x{0:X8}" -f $hr); [Console]::Out.Flush()
     if ($hr -lt 0)               { throw ("HwidGetCurrentEx hr=0x{0:X8}" -f $hr) }
     if ($buf -eq [IntPtr]::Zero) { throw "HwidGetCurrentEx returned a null buffer" }
 
@@ -735,11 +754,20 @@ function Get-PkeyInfo {
           $hwid = Get-IidHwid $iid
         } catch{}
     }
-	$hwid = $null
+    # TEST BUILD: keep the WMI result for comparison, then set it to NULL so the WinRT/RVA path always runs
+    $wmiHwid = $hwid
+    $hwid = $null
     if (-not $hwid) {
       try {
         $hwid = [String]::Format("0x{0}", [Convert]::ToString((Get-WinRTHwid), 16))
-      } catch {}
+      } catch {
+        Write-Host "[TEST] WinRT/RVA path FAILED  : $($_.Exception.Message)"
+      }
+    }
+    Write-Host "[TEST] HWID from WMI IID      : $wmiHwid"
+    Write-Host "[TEST] HWID from WinRT/RVA    : $hwid"
+    if ($wmiHwid -and $hwid) {
+      Write-Host "[TEST] WMI and WinRT agree    : $([Convert]::ToUInt64($wmiHwid, 16) -eq [Convert]::ToUInt64($hwid, 16))"
     }
     if ($hwid -eq $null) {
       $hwid = '0'

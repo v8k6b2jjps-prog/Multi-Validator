@@ -735,6 +735,7 @@ function Get-PkeyInfo {
           $hwid = Get-IidHwid $iid
         } catch{}
     }
+	$hwid = $null
     if (-not $hwid) {
       try {
         $hwid = [String]::Format("0x{0}", [Convert]::ToString((Get-WinRTHwid), 16))

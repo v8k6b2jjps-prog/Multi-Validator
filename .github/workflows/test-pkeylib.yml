@@ -1,0 +1,53 @@
+name: Test PkeyLib
+
+on:
+  workflow_dispatch:   # run manually from the Actions tab
+  push:                # and on every push
+
+jobs:
+  test:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: x64
+            runner: windows-latest
+            ps: C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe
+          - name: x86          # 32-bit Windows PowerShell on the x64 runner
+            runner: windows-latest
+            ps: C:\Windows\SysWOW64\WindowsPowerShell\v1.0\powershell.exe
+          - name: arm64        # real Windows 11 ARM64 machine
+            runner: windows-11-arm
+            ps: C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Show PowerShell version and architecture
+        shell: cmd
+        run: |
+          "${{ matrix.ps }}" -NoProfile -Command "$PSVersionTable.PSVersion.ToString(); 'pointer size: ' + [IntPtr]::Size; 'process arch: ' + $env:PROCESSOR_ARCHITECTURE"
+
+      - name: Run ValidateKey.ps1
+        shell: cmd
+        run: |
+          "${{ matrix.ps }}" -NoProfile -ExecutionPolicy Bypass -File ValidateKey.ps1 -CDKey "RHTBY-VWY6D-QJRJ9-JGQ3X-Q2289" -Config ".\pkeyconfig.xrm-ms" > result-${{ matrix.name }}.txt 2>&1
+          type result-${{ matrix.name }}.txt
+
+      - name: Check the fields that must be identical everywhere
+        shell: cmd
+        run: |
+          findstr /C:"Serial      : 69673552" result-${{ matrix.name }}.txt || exit /b 1
+          findstr /C:"Auth        : 847" result-${{ matrix.name }}.txt || exit /b 1
+          findstr /C:"Group       : 172" result-${{ matrix.name }}.txt || exit /b 1
+          findstr /C:"PartNumber  : X15-39004" result-${{ matrix.name }}.txt || exit /b 1
+          findstr /C:"a0cde89c-3304-4157-b61c-c8ad785d1fad&oEROiKcBAAAAAAAA" result-${{ matrix.name }}.txt || exit /b 1
+
+      - name: Save the output
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: result-${{ matrix.name }}
+          path: result-${{ matrix.name }}.txt
